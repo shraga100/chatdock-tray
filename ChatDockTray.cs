@@ -23,18 +23,38 @@
 //                       {event:"tracked", id, ok}
 //                       {event:"click"} / {event:"options"} / {event:"show", id}
 //
-// Build: install.ps1 (uses the C# compiler that ships with Windows).
+// The same file installs and removes itself (no installer needed):
+//   ChatDockTray.exe                         double-click: install, with a message
+//   ChatDockTray.exe --install [--quiet] [--extension-id <id>]...
+//   ChatDockTray.exe --uninstall [--quiet]
+// It copies itself to %LOCALAPPDATA%\ChatDock, registers itself with Chrome and
+// Edge as the native messaging host "com.chatdock.tray" for the ChatDock
+// extension ids (current user, HKCU), and adds an entry to Windows' installed
+// apps list (that is how winget sees it). Chrome starts it with the
+// extension's origin as its first argument: that is the tray mode.
+//
+// Build: tools/build_tray.ps1 (the C# compiler that ships with Windows; the two
+// icons are embedded as resources).
 using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using Microsoft.Win32;
+
+[assembly: AssemblyTitle("ChatDock tray helper")]
+[assembly: AssemblyProduct("ChatDock tray helper")]
+[assembly: AssemblyCompany("shraga100")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
 
 namespace ChatDock
 {
@@ -115,8 +135,8 @@ namespace ChatDock
             ui.CreateControl(); // so BeginInvoke works from the reader thread
             try { taskbar = (ITaskbarList3)new TaskbarListClass(); taskbar.HrInit(); } catch { taskbar = null; }
             string dir = AppDomain.CurrentDomain.BaseDirectory;
-            onBase = Load(Path.Combine(dir, "icon.png"));
-            offBase = Load(Path.Combine(dir, "icon-off.png")) ?? onBase;
+            onBase = Setup.Resource("icon.png") ?? Load(Path.Combine(dir, "icon.png"));
+            offBase = Setup.Resource("icon-off.png") ?? Load(Path.Combine(dir, "icon-off.png")) ?? onBase;
             SetIcon(false, "");
             icon.Text = "ChatDock";
             icon.Visible = true;
@@ -476,10 +496,201 @@ namespace ChatDock
         }
 
         [STAThread]
-        static void Main()
+        static int Main(string[] args)
         {
             Application.EnableVisualStyles();
-            Application.Run(new TrayApp());
+            // Chrome passes the calling extension's origin (and, on Windows, a
+            // --parent-window=<n> argument).
+            foreach (var a in args)
+                if (a.StartsWith("chrome-extension://", StringComparison.OrdinalIgnoreCase))
+                {
+                    Application.Run(new TrayApp());
+                    return 0;
+                }
+            bool quiet = Array.Exists(args, a => a == "--quiet" || a == "/quiet" || a == "-q");
+            if (Array.Exists(args, a => a == "--uninstall")) return Setup.Uninstall(quiet);
+            var ids = new List<string>();
+            for (int i = 0; i < args.Length; i++)
+                if (args[i] == "--extension-id" && i + 1 < args.Length)
+                    foreach (var id in args[++i].Split(',', ';', ' ')) if (id.Length > 0) ids.Add(id.Trim());
+            return Setup.Install(ids, quiet);
+        }
+    }
+
+    // ------------------------------------------------------------ install
+
+    static class Setup
+    {
+        public const string Version = "1.0.0";
+        const string HostName = "com.chatdock.tray";
+        const string ArpKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\ChatDockTray";
+        // ChatDock's extension ids. Each installation can add its own (the
+        // options page passes chrome.runtime.id with --extension-id), and ids
+        // registered before are kept.
+        static readonly string[] KnownIds = { "bddogopfkajnmdmhgkbpdcnpimdcckmd" };
+        static readonly string[] Browsers = { @"Software\Google\Chrome", @"Software\Microsoft\Edge" };
+
+        static bool Hebrew
+        {
+            get { return System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "he"; }
+        }
+
+        static string Dir
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ChatDock"); }
+        }
+
+        public static Bitmap Resource(string name)
+        {
+            try
+            {
+                var s = Assembly.GetExecutingAssembly().GetManifestResourceStream(name);
+                return s == null ? null : new Bitmap(s);
+            }
+            catch { return null; }
+        }
+
+        static bool ValidId(string id)
+        {
+            if (id.Length != 32) return false;
+            foreach (char c in id) if (c < 'a' || c > 'p') return false;
+            return true;
+        }
+
+        // Ids already in the registered manifest, so an update keeps them.
+        static List<string> RegisteredIds(string manifestPath)
+        {
+            var ids = new List<string>();
+            try
+            {
+                if (!File.Exists(manifestPath)) return ids;
+                var m = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(manifestPath));
+                object list;
+                if (m.TryGetValue("allowed_origins", out list) && list is System.Collections.IEnumerable)
+                    foreach (var o in (System.Collections.IEnumerable)list)
+                    {
+                        string origin = Convert.ToString(o);
+                        string id = origin.Replace("chrome-extension://", "").Trim('/');
+                        if (ValidId(id)) ids.Add(id);
+                    }
+            }
+            catch { }
+            return ids;
+        }
+
+        static void StopOthers()
+        {
+            int me = Process.GetCurrentProcess().Id;
+            foreach (var p in Process.GetProcessesByName("ChatDockTray"))
+            {
+                try { if (p.Id != me) { p.Kill(); p.WaitForExit(3000); } } catch { }
+            }
+        }
+
+        public static int Install(List<string> extra, bool quiet)
+        {
+            try
+            {
+                string dir = Dir;
+                Directory.CreateDirectory(dir);
+                string exe = Path.Combine(dir, "ChatDockTray.exe");
+                string self = Assembly.GetExecutingAssembly().Location;
+                string manifestPath = Path.Combine(dir, HostName + ".json");
+
+                var ids = new List<string>();
+                foreach (var id in extra) if (ValidId(id) && !ids.Contains(id)) ids.Add(id);
+                foreach (var id in RegisteredIds(manifestPath)) if (!ids.Contains(id)) ids.Add(id);
+                foreach (var id in KnownIds) if (!ids.Contains(id)) ids.Add(id);
+
+                // A running copy holds the file; Chrome starts the new one by itself.
+                StopOthers();
+                if (!string.Equals(Path.GetFullPath(self), Path.GetFullPath(exe), StringComparison.OrdinalIgnoreCase))
+                {
+                    for (int i = 0; ; i++)
+                    {
+                        try { File.Copy(self, exe, true); break; }
+                        catch (IOException) { if (i >= 10) throw; Thread.Sleep(300); }
+                    }
+                }
+
+                var origins = new List<string>();
+                foreach (var id in ids) origins.Add("chrome-extension://" + id + "/");
+                var manifest = new Dictionary<string, object>
+                {
+                    { "name", HostName },
+                    { "description", "ChatDock tray icon" },
+                    { "path", exe },
+                    { "type", "stdio" },
+                    { "allowed_origins", origins }
+                };
+                File.WriteAllText(manifestPath, new JavaScriptSerializer().Serialize(manifest), new UTF8Encoding(false));
+
+                foreach (var b in Browsers)
+                    using (var k = Registry.CurrentUser.CreateSubKey(b + @"\NativeMessagingHosts\" + HostName))
+                        k.SetValue("", manifestPath);
+
+                // Windows' installed apps list (Settings > Apps), and winget's view of it.
+                using (var k = Registry.CurrentUser.CreateSubKey(ArpKey))
+                {
+                    k.SetValue("DisplayName", "ChatDock tray helper");
+                    k.SetValue("DisplayVersion", Version);
+                    k.SetValue("Publisher", "shraga100");
+                    k.SetValue("DisplayIcon", exe);
+                    k.SetValue("InstallLocation", dir);
+                    k.SetValue("URLInfoAbout", "https://github.com/shraga100/chatdock-tray");
+                    k.SetValue("UninstallString", "\"" + exe + "\" --uninstall");
+                    k.SetValue("QuietUninstallString", "\"" + exe + "\" --uninstall --quiet");
+                    k.SetValue("NoModify", 1, RegistryValueKind.DWord);
+                    k.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+                    k.SetValue("EstimatedSize", (int)(new FileInfo(exe).Length / 1024) + 1, RegistryValueKind.DWord);
+                    k.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd"));
+                }
+
+                Console.WriteLine("ChatDock tray helper " + Version + " installed in " + dir);
+                if (!quiet)
+                    MessageBox.Show(Hebrew
+                        ? "רכיב המגש של ChatDock הותקן.\nהסמל יופיע בעוד כמה שניות, כשבהגדרות של ChatDock מסומן \"סמל במגש המערכת\"."
+                        : "The ChatDock tray helper is installed.\nThe icon appears in a few seconds while \"Icon in the system tray\" is on in ChatDock's options.",
+                        "ChatDock", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return 0;
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine("ChatDock tray helper was not installed: " + e.Message);
+                if (!quiet) MessageBox.Show(e.Message, "ChatDock", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return 1;
+            }
+        }
+
+        public static int Uninstall(bool quiet)
+        {
+            try
+            {
+                StopOthers();
+                foreach (var b in Browsers)
+                    Registry.CurrentUser.DeleteSubKeyTree(b + @"\NativeMessagingHosts\" + HostName, false);
+                Registry.CurrentUser.DeleteSubKeyTree(ArpKey, false);
+                // This program may be the copy in that folder: the folder goes
+                // a moment after it exits.
+                string dir = Dir;
+                if (Directory.Exists(dir))
+                {
+                    Process.Start(new ProcessStartInfo("cmd.exe",
+                        "/c ping 127.0.0.1 -n 3 > nul & rmdir /s /q \"" + dir + "\"")
+                    { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden });
+                }
+                Console.WriteLine("ChatDock tray helper removed.");
+                if (!quiet)
+                    MessageBox.Show(Hebrew ? "רכיב המגש של ChatDock הוסר." : "The ChatDock tray helper was removed.",
+                        "ChatDock", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return 0;
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine("ChatDock tray helper was not removed: " + e.Message);
+                if (!quiet) MessageBox.Show(e.Message, "ChatDock", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return 1;
+            }
         }
     }
 }
