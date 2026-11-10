@@ -12,10 +12,15 @@
 //
 // Messages are JSON, each preceded by its length (4 bytes, native order),
 // as Chrome's native messaging protocol requires.
+// * Shows the unread count on the taskbar button of ChatDock's shown windows
+//   (ITaskbarList3.SetOverlayIcon), as chat apps do.
+//
 //   from the extension: {cmd:"status", text, tooltip, connected}
 //                       {cmd:"track", id, marker}   find the window whose title is marker
-//                       {cmd:"untrack", id}
-//   to the extension:   {event:"tracked", id, ok}
+//                       {cmd:"release", id}         shown again: back on the taskbar, with the count
+//                       {cmd:"untrack", id}         closed / no longer ChatDock's
+//   to the extension:   {event:"hello", version}       at start (2 = knows "release")
+//                       {event:"tracked", id, ok}
 //                       {event:"click"} / {event:"options"} / {event:"show", id}
 //
 // Build: install.ps1 (uses the C# compiler that ships with Windows).
@@ -33,14 +38,27 @@ using System.Windows.Forms;
 
 namespace ChatDock
 {
-    [ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface ITaskbarList
+    // ITaskbarList3, declared with every method in vtable order (ITaskbarList,
+    // ITaskbarList2, then ITaskbarList3) up to the one used, SetOverlayIcon.
+    [ComImport, Guid("ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ITaskbarList3
     {
         void HrInit();
         void AddTab(IntPtr hwnd);
         void DeleteTab(IntPtr hwnd);
         void ActivateTab(IntPtr hwnd);
         void SetActiveAlt(IntPtr hwnd);
+        void MarkFullscreenWindow(IntPtr hwnd, [MarshalAs(UnmanagedType.Bool)] bool fullscreen);
+        void SetProgressValue(IntPtr hwnd, ulong completed, ulong total);
+        void SetProgressState(IntPtr hwnd, int state);
+        void RegisterTab(IntPtr tab, IntPtr mdi);
+        void UnregisterTab(IntPtr tab);
+        void SetTabOrder(IntPtr tab, IntPtr insertBefore);
+        void SetTabActive(IntPtr tab, IntPtr mdi, uint flags);
+        void ThumbBarAddButtons(IntPtr hwnd, uint count, IntPtr buttons);
+        void ThumbBarUpdateButtons(IntPtr hwnd, uint count, IntPtr buttons);
+        void ThumbBarSetImageList(IntPtr hwnd, IntPtr imageList);
+        void SetOverlayIcon(IntPtr hwnd, IntPtr icon, [MarshalAs(UnmanagedType.LPWStr)] string description);
     }
 
     [ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")]
@@ -77,20 +95,25 @@ namespace ChatDock
         readonly ContextMenuStrip menu = new ContextMenuStrip();
         readonly Dictionary<long, IntPtr> windows = new Dictionary<long, IntPtr>();
         readonly HashSet<IntPtr> hidden = new HashSet<IntPtr>();
+        // Known windows that are shown (on the taskbar, with the count).
+        readonly HashSet<long> released = new HashSet<long>();
+        string count = "";
+        IntPtr overlayHandle = IntPtr.Zero;
+        int overlayTick = 0;
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
         readonly object writeLock = new object();
         readonly Stream stdout = Console.OpenStandardOutput();
         readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer();
         readonly Native.WinEventProc hookProc;
         readonly List<IntPtr> hooks = new List<IntPtr>();
-        ITaskbarList taskbar;
+        ITaskbarList3 taskbar;
         Bitmap onBase, offBase;
         IntPtr iconHandle = IntPtr.Zero;
 
         public TrayApp()
         {
             ui.CreateControl(); // so BeginInvoke works from the reader thread
-            try { taskbar = (ITaskbarList)new TaskbarListClass(); taskbar.HrInit(); } catch { taskbar = null; }
+            try { taskbar = (ITaskbarList3)new TaskbarListClass(); taskbar.HrInit(); } catch { taskbar = null; }
             string dir = AppDomain.CurrentDomain.BaseDirectory;
             onBase = Load(Path.Combine(dir, "icon.png"));
             offBase = Load(Path.Combine(dir, "icon-off.png")) ?? onBase;
@@ -113,6 +136,7 @@ namespace ChatDock
             tick.Start();
 
             new Thread(ReadLoop) { IsBackground = true }.Start();
+            Send(new { @event = "hello", version = 2 });
         }
 
         static Bitmap Load(string path)
@@ -191,9 +215,16 @@ namespace ChatDock
                     string tip = Str(msg, "tooltip");
                     if (tip.Length == 0) tip = "ChatDock";
                     icon.Text = tip.Length > 63 ? tip.Substring(0, 62) + "…" : tip;
+                    string text = Str(msg, "connected") == "True" ? Str(msg, "text") : "";
+                    if (text != count) { count = text; MakeOverlay(); }
+                    UpdateOverlays();
                     break;
                 case "track":
+                    released.Remove(Num(msg, "id"));
                     Track(Num(msg, "id"), Str(msg, "marker"), 0);
+                    break;
+                case "release":
+                    Release(Num(msg, "id"));
                     break;
                 case "untrack":
                     Untrack(Num(msg, "id"), false);
@@ -225,22 +256,84 @@ namespace ChatDock
                 return;
             }
             windows[id] = found;
-            Apply(found);
+            if (released.Contains(id)) SetOverlay(found);
+            else Apply(found);
             Send(new { @event = "tracked", id = id, ok = true });
+        }
+
+        // Shown: back on the taskbar, and it keeps the count on its button.
+        void Release(long id)
+        {
+            released.Add(id);
+            IntPtr h;
+            if (!windows.TryGetValue(id, out h)) return; // found later (Track)
+            Restore(h);
+            SetOverlay(h);
         }
 
         void Untrack(long id, bool keep)
         {
+            released.Remove(id);
             IntPtr h;
             if (!windows.TryGetValue(id, out h)) return;
             windows.Remove(id);
+            ClearOverlay(h);
             Restore(h);
         }
 
+        // Hidden ChatDock windows (tracked and not released) stay off the taskbar.
         bool IsTracked(IntPtr h)
         {
-            foreach (var v in windows.Values) if (v == h) return true;
+            foreach (var kv in windows) if (kv.Value == h && !released.Contains(kv.Key)) return true;
             return false;
+        }
+
+        // ------------------------------------------------- taskbar count
+
+        // The count as a small red disc, the size Windows draws overlays (16 px).
+        void MakeOverlay()
+        {
+            IntPtr old = overlayHandle;
+            overlayHandle = IntPtr.Zero;
+            if (count.Length > 0)
+            {
+                using (var bmp = new Bitmap(16, 16))
+                {
+                    using (var g = Graphics.FromImage(bmp))
+                    {
+                        g.SmoothingMode = SmoothingMode.AntiAlias;
+                        g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                        using (var red = new SolidBrush(Color.FromArgb(217, 48, 37))) g.FillEllipse(red, 0, 0, 15, 15);
+                        string t = count.Length > 2 ? "+" : count;
+                        using (var f = new Font("Segoe UI", t.Length > 1 ? 7.5f : 10f, FontStyle.Bold, GraphicsUnit.Pixel))
+                        using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                        {
+                            g.DrawString(t, f, Brushes.White, new RectangleF(0, 0.5f, 16, 16), sf);
+                        }
+                    }
+                    overlayHandle = bmp.GetHicon();
+                }
+            }
+            UpdateOverlays();
+            if (old != IntPtr.Zero) Native.DestroyIcon(old);
+        }
+
+        void SetOverlay(IntPtr h)
+        {
+            if (taskbar == null || !Native.IsWindow(h)) return;
+            string what = count.Length == 0 ? null : (Hebrew ? count + " הודעות שלא נקראו" : count + " unread");
+            try { taskbar.SetOverlayIcon(h, overlayHandle, what); } catch { }
+        }
+
+        void ClearOverlay(IntPtr h)
+        {
+            if (taskbar == null || !Native.IsWindow(h)) return;
+            try { taskbar.SetOverlayIcon(h, IntPtr.Zero, null); } catch { }
+        }
+
+        void UpdateOverlays()
+        {
+            foreach (var kv in windows) if (released.Contains(kv.Key)) SetOverlay(kv.Value);
         }
 
         void Apply(IntPtr h)
@@ -289,9 +382,12 @@ namespace ChatDock
             foreach (var kv in windows)
             {
                 if (!Native.IsWindow(kv.Value)) gone.Add(kv.Key);
-                else Apply(kv.Value);
+                else if (!released.Contains(kv.Key)) Apply(kv.Value);
             }
-            foreach (var id in gone) { hidden.Remove(windows[id]); windows.Remove(id); }
+            foreach (var id in gone) { hidden.Remove(windows[id]); windows.Remove(id); released.Remove(id); }
+            // Chrome may draw its own overlay (its profile picture) over ours: put
+            // the count back now and then.
+            if (++overlayTick % 5 == 0) UpdateOverlays();
         }
 
         // ---------------------------------------------------------- tray
@@ -312,7 +408,8 @@ namespace ChatDock
             menu.Items.Clear();
             menu.RightToLeft = Hebrew ? RightToLeft.Yes : RightToLeft.No;
             menu.Items.Add(Hebrew ? "פתיחת ChatDock" : "Open ChatDock", null, (s, e) => Click());
-            var list = new List<KeyValuePair<long, IntPtr>>(windows);
+            var list = new List<KeyValuePair<long, IntPtr>>();
+            foreach (var kv in windows) if (!released.Contains(kv.Key)) list.Add(kv);
             if (list.Count > 0) menu.Items.Add(new ToolStripSeparator());
             foreach (var kv in list)
             {
@@ -370,7 +467,7 @@ namespace ChatDock
 
         void Quit()
         {
-            foreach (var h in windows.Values) Restore(h);
+            foreach (var h in windows.Values) { ClearOverlay(h); Restore(h); }
             windows.Clear();
             foreach (var hook in hooks) Native.UnhookWinEvent(hook);
             icon.Visible = false;

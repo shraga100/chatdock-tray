@@ -1,7 +1,7 @@
 # ChatDock tray helper
 
 A small Windows helper for the **ChatDock** Chrome extension (an unofficial companion for Google Chat).
-It shows ChatDock's icon with the unread count in the system tray, and keeps ChatDock's hidden windows off the taskbar.
+It shows ChatDock's icon with the unread count in the system tray and on the ChatDock window's taskbar button, and keeps ChatDock's hidden windows off the taskbar.
 
 ## Install
 
