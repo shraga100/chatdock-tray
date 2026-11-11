@@ -63,3 +63,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 The winget manifests are in [`winget/`](winget).
 
 Freeware: see [LICENSE](LICENSE).
+
+## Privacy
+
+The helper opens no network connection and gets only the unread count and window ids from ChatDock. See the [privacy policy](PRIVACY.md) for ChatDock and this helper.
